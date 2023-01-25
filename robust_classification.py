@@ -80,7 +80,7 @@ def main(args):
     # Resize the image to 256 x 256, the size on which SD was trained
     #img = img.resize((SD_IM_DIM, SD_IM_DIM), resample=Image.Resampling.LANCZOS)
 
-    img_np = np.array(img, copy=True)
+    img_np = np.array(img.convert("RGB"), copy=True)
     img_t = torch.as_tensor(img_np)
     img_t = img_t.to(device=device)
     img_t = img_t.to(dtype=torch.float32)
@@ -93,88 +93,107 @@ def main(args):
     img_t_reshaped = torch.stack([img_t for _ in range(args.batch_size)])
     img_t_reshaped = einops.rearrange(img_t_reshaped, 'b h w c -> b c h w')
     img_t_reshaped = img_t_reshaped.to(memory_format=torch.contiguous_format)
+    
+    # This seems to be important to be able to decode the image properly
+    img_t_reshaped /= 255
+    img_t_reshaped = img_t_reshaped * 2 - 1
+
     encoder_posterior = model.encode_first_stage(img_t_reshaped)
     latent = model.get_first_stage_encoding(encoder_posterior)
-  
+
+    # Inspect the decoded image
+    #latent = latent[:1]
+    #x_sample = model.decode_first_stage(latent)
+    #x_sample = torch.clamp((x_sample + 1.0) / 2.0, min=0.0, max=1.0)
+    #x_sample = x_sample[0]
+    #x_sample = 255 * einops.rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+    #img = Image.fromarray(x_sample.astype(np.uint8))
+    #path = f"tests/img.png"
+    #img.save(path)
+
     # The codebase is poorly documented and so the positional encodings are
     # quite mysterious.
     assert(not model.use_positional_encodings)
  
-    t = 100
-    t_tensor = torch.tensor(
-        [t for _ in range(args.batch_size)],
-        device=device,
-        dtype=torch.int64,
-    )
-
-    losses = []
     b = args.batch_size
     no_batches = len(classes) // b
+    losses = [0. for _ in range(no_batches)]
     noise = torch.randn_like(latent[0])
     noise = torch.stack([noise for _ in range(b)])
-    for c in [classes[i * b:(i + 1) * b] for i in range(no_batches)]:
-        print(c)
-
-        # Prepare the conditioning
-        cond = model.get_learned_conditioning(c)
-
-        precision_scope = (
-            torch.autocast if args.precision == "autocast" else nullcontext
+    for t in [500]:#range(0, model.num_timesteps, 10):
+        print(t)
+        t_tensor = torch.tensor(
+            [t for _ in range(args.batch_size)],
+            device=device,
+            dtype=torch.int64,
         )
-        with torch.no_grad(), \
-            precision_scope("cuda"), \
-            model.ema_scope():
-            # Compute reconstruction loss
-            x_noisy = model.q_sample(
-                x_start=latent, 
-                t=t_tensor, 
-                noise=noise
-            )
-            model_output = model.apply_model(
-                x_noisy, 
-                t_tensor, 
-                cond
-            )
-            
-            loss_dict = {}
-            prefix = 'train' if model.training else 'val'
+        for i,c in enumerate([classes[i * b:(i + 1) * b] for i in range(no_batches)]):  
+            # Prepare the conditioning
+            print(c)
+            cond = model.get_learned_conditioning(c)
 
-            if model.parameterization == "x0":
-                target = x_start
-            elif model.parameterization == "eps":
-                target = noise
-            elif model.parameterization == "v":
-                target = model.get_v(
-                    latent, 
-                    noise, 
-                    t_tensor
+            precision_scope = (
+                torch.autocast if args.precision == "autocast" else nullcontext
+            )
+            with torch.no_grad(), \
+                precision_scope("cuda"), \
+                model.ema_scope():
+
+                # Compute reconstruction loss
+                x_noisy = model.q_sample(
+                    x_start=latent, 
+                    t=t_tensor, 
+                    noise=noise
                 )
-            else:
-                raise NotImplementedError()
 
-            loss_simple = model.get_loss(model_output, target, mean=False).mean([1, 2, 3])
-            loss_dict.update({f'{prefix}/loss_simple': loss_simple})
+                #x_samples = model.decode_first_stage(x_noisy)
+                #x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                #for c, x_sample in zip(c, x_samples):
+                #    x_sample = 255 * einops.rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                #    img = Image.fromarray(x_sample.astype(np.uint8))
+                #    path = f"tests/{c}_{t}.png"
+                #    img.save(path)
 
-            logvar_t = model.logvar.to(model.device)[t]
-            loss = loss_simple / torch.exp(logvar_t) + logvar_t
-            if model.learn_logvar:
-                loss_dict.update({f'{prefix}/loss_gamma': loss})
-                loss_dict.update({'logvar': model.logvar.data})
+                model_output = model.apply_model(
+                    x_noisy, 
+                    t_tensor, 
+                    cond
+                )
+ 
+                loss_dict = {}
+                prefix = 'train' if model.training else 'val'
 
-            loss *= model.l_simple_weight
+                if model.parameterization == "x0":
+                    target = x_start
+                elif model.parameterization == "eps":
+                    target = noise
+                elif model.parameterization == "v":
+                    target = model.get_v(
+                        latent, 
+                        noise, 
+                        t_tensor
+                    )
+                else:
+                    raise NotImplementedError()
 
-            loss_vlb = model.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
-            loss_vlb = (model.lvlb_weights[t] * loss_vlb)
-            loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
-            loss += (model.original_elbo_weight * loss_vlb)
-            loss_dict.update({f'{prefix}/loss': loss})
+                loss_simple = model.get_loss(model_output, target, mean=False).mean([1, 2, 3])
+                loss_dict.update({f'{prefix}/loss_simple': loss_simple})
 
-            print(loss_simple)
-            print(loss_vlb)
+                logvar_t = model.logvar.to(model.device)[t]
+                loss = loss_simple / torch.exp(logvar_t) + logvar_t
+                if model.learn_logvar:
+                    loss_dict.update({f'{prefix}/loss_gamma': loss})
+                    loss_dict.update({'logvar': model.logvar.data})
 
-        print(loss.shape)
-        losses.append(loss)
+                loss *= model.l_simple_weight
 
+                loss_vlb = model.get_loss(model_output, target, mean=False).mean(dim=(1, 2, 3))
+                loss_vlb = (model.lvlb_weights[t] * loss_vlb)
+                loss_dict.update({f'{prefix}/loss_vlb': loss_vlb})
+                loss += (model.original_elbo_weight * loss_vlb)
+                loss_dict.update({f'{prefix}/loss': loss})
+
+            losses[i] += loss
 
     print(torch.cat(losses))
 
